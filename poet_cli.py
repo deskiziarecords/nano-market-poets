@@ -5,8 +5,8 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from pathlib import Path
-import time
 from datetime import datetime, timedelta
+import time
 
 # ============================================
 # CONFIGURATION
@@ -24,61 +24,81 @@ SEQ_LEN = 64
 app = typer.Typer(add_completion=False)
 
 # ============================================
-# 1. THE FETCHER (DUKASCOPY / WRAPPER)
+# 1. FIXED FETCHER (Handles YF Limits)
 # ============================================
 class DataFetcher:
-    """
-    Handles fetching data.
-    Note: Replace the 'fetch' method with your specific Dukascopy API logic.
-    """
     def __init__(self, asset: str, timeframe: str, days: int):
         self.asset = asset.upper()
         self.tf = timeframe
         self.days = days
 
     def fetch(self, save_path: Path):
-        typer.echo(f" Attempting to fetch {self.asset} ({self.tf}) for {self.days} days...")
-        
-        # --- REAL DUKASCOPY IMPLEMENTATION (Pseudo-code) ---
-        # from dukascopy import Dukascopy
-        # api = Dukascopy()
-        # api.login("user", "pass") # If needed
-        # df = api.get_data(self.asset, self.tf, start_date, end_date)
-        # -------------------------------------------------
-        
-        # --- DEMO IMPLEMENTATION (Using yfinance for demonstration) ---
-        # Remove this block when you implement real API
+        typer.echo(f"🔌 Fetching {self.asset} ({self.tf}) for {self.days} days...")
+        typer.echo(f"   [Note: Yahoo limits 1m data to 7 days. Fetching in chunks...]")
+
         try:
             import yfinance as yf
             # Map standard TFs to Yahoo TFs
-            tf_map = {'M1': '1m', 'H1': '1h', 'D': '1d'}
+            tf_map = {'M1': '1m', 'H1': '1h', 'D': '1d', 'M15': '15m'}
             yf_tf = tf_map.get(self.tf, '1m')
             
             ticker = f"{self.asset[:3]}{self.asset[3:]}=X"
-            start = (datetime.now() - timedelta(days=self.days)).strftime('%Y-%m-%d')
             
-            typer.echo(f"   [Demo Mode] Using yfinance for {ticker}...")
-            df = yf.download(ticker, start=start, interval=yf_tf, progress=False)
+            # CALCULATE DATES
+            end_date = datetime.now()
+            start_date = end_date - timedelta(days=self.days)
             
-            # Standardize columns for our parser
+            # CHUNKED DOWNLOAD (To bypass 7-day limit)
+            all_dfs = []
+            current_chunk_end = end_date
+            
+            while current_chunk_end > start_date:
+                current_chunk_start = current_chunk_end - timedelta(days=7)
+                
+                # Format dates for yfinance
+                start_str = current_chunk_start.strftime('%Y-%m-%d')
+                end_str = current_chunk_end.strftime('%Y-%m-%d')
+                
+                typer.echo(f"   📥 Fetching {start_str} to {end_str}...", nl=False)
+                
+                try:
+                    temp_df = yf.download(ticker, start=start_str, end=end_str, interval=yf_tf, progress=False)
+                    all_dfs.append(temp_df)
+                    typer.echo(" ✅", fg=typer.colors.GREEN)
+                except Exception as e:
+                    typer.echo(f" ⚠️  Error in chunk: {e}")
+                
+                # Move back 7 days
+                current_chunk_end = current_chunk_start
+                # Small delay to be polite to API
+                time.sleep(0.5)
+
+            # MERGE ALL CHUNKS
+            if not all_dfs:
+                typer.secho(f"❌ No data retrieved.", fg=typer.colors.RED)
+                raise Exception("Download failed")
+                
+            df = pd.concat(all_dfs)
+            
+            # CLEAN UP & SORT
             df.reset_index(inplace=True)
             df.rename(columns={'Date': 'UTC', 'Datetime': 'UTC'}, inplace=True)
+            df = df.sort_values('UTC').drop_duplicates(subset=['UTC']).reset_index(drop=True)
             
-            # Ensure standard OHLCV
+            # SELECT ONLY OHLCV
             df = df[['UTC', 'Open', 'High', 'Low', 'Close', 'Volume']]
             
         except Exception as e:
-            typer.echo(f" Fetch failed: {e}")
+            typer.echo(f"❌ Fetch failed: {e}")
             raise e
-        # -------------------------------------------------
 
-        # Save to RAW
+        # SAVE
         save_path.parent.mkdir(parents=True, exist_ok=True)
         df.to_csv(save_path, index=False)
-        typer.echo(f" Saved raw data to {save_path}")
+        typer.echo(f"✅ Saved {len(df)} bars to {save_path}")
 
 # ============================================
-# 2. THE PARSER (From Previous Logic)
+# 2. FIXED ENCODER (Handles String/Float Conversion)
 # ============================================
 class SmartPoetEncoder:
     def __init__(self):
@@ -86,10 +106,22 @@ class SmartPoetEncoder:
         
     def encode_df(self, df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()
-        # Normalize Headers
-        df.columns = df.columns.str.strip().str.title()
         
-        # ATR
+        # 1. Normalize Headers
+        df.columns = df.columns.str.strip().str.replace('\ufeff', '').str.title()
+        
+        # 2. FIX THE CRASH: Force Numeric Conversion
+        # This fixes "operation 'sub' not supported for dtype 'str'"
+        numeric_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
+        for col in numeric_cols:
+            if col in df.columns:
+                # Convert to numeric, coerce errors to NaN (safe fallback)
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+        
+        # Drop rows with NaNs in price data (bad parsing)
+        df.dropna(subset=['Open', 'High', 'Low', 'Close'], inplace=True)
+        
+        # 3. ATR
         high, low, close = df['High'], df['Low'], df['Close']
         tr1 = high - low
         tr2 = (high - close.shift()).abs()
@@ -98,7 +130,7 @@ class SmartPoetEncoder:
         atr = tr.rolling(window=14).mean()
         df['ATR'] = atr
         
-        # Logic
+        # 4. Logic
         tokens = []
         for i in range(len(df)):
             row = df.iloc[i]
@@ -168,7 +200,7 @@ class NanoMold(nn.Module):
         return self.head(x)[:, -1, :]
 
 # ============================================
-# 4. MAIN CLI LOGIC
+# 4. MAIN CLI
 # ============================================
 
 @app.command()
@@ -178,7 +210,7 @@ def run(
     days: int = typer.Option(365, help="Number of days back to fetch"),
     mode: str = typer.Option("train", help="'train' (new) or 'retrain' (from scratch)")
 ):
-    """ The full workflow: Download -> Parse -> Train"""
+    """🚀 The full workflow: Download -> Parse -> Train"""
     
     # 1. Setup Paths
     raw_file = DATA_RAW / f"{asset}_{timeframe}.csv"
@@ -196,14 +228,14 @@ def run(
     try:
         df_raw = pd.read_csv(raw_file)
     except FileNotFoundError:
-        typer.echo(" Raw file not found!")
+        typer.echo("❌ Raw file not found!")
         raise typer.Exit()
         
     encoder = SmartPoetEncoder()
     df_encoded = encoder.encode_df(df_raw)
     df_windows = encoder.to_windows(df_encoded)
     df_windows.to_csv(train_file, index=False)
-    typer.echo(f" Training data created: {len(df_windows)} samples")
+    typer.echo(f"✅ Training data created: {len(df_windows)} samples")
     
     # 4. PREPARE MODEL
     typer.secho(f"\n[Phase 3] Loading Mold", fg=typer.colors.BRIGHT_CYAN)
@@ -215,16 +247,13 @@ def run(
     
     if mode == "train":
         if not VIRGIN_PATH.exists():
-            typer.secho(f"  Virgin Mold not found at {VIRGIN_PATH}!", fg=typer.colors.YELLOW)
-            typer.echo("   Train without it? (This is hard mode)")
-            typer.echo("   Continuing...")
-            # If we wanted to enforce it, we would raise typer.Abort()
+            typer.secho(f"⚠️  Virgin Mold not found. Training from scratch (Hard Mode).", fg=typer.colors.YELLOW)
         else:
-            typer.echo(f" Loading Virgin Grammar from {VIRGIN_PATH}...")
+            typer.echo(f"📜 Loading Virgin Grammar...")
             state = torch.load(VIRGIN_PATH, map_location=device)
             model.load_state_dict(state)
     elif mode == "retrain":
-        typer.echo(" Initializing fresh model (Retrain mode)")
+        typer.echo("🆕 Initializing fresh model")
     
     optimizer = optim.AdamW(model.parameters(), lr=1e-4)
     loss_fn = nn.CrossEntropyLoss()
@@ -232,13 +261,10 @@ def run(
     # 5. TRAIN
     typer.secho(f"\n[Phase 4] Training Vessel", fg=typer.colors.BRIGHT_CYAN)
     
-    # Simple Training Loop
     epochs = 10
-    # Convert data to tensors (In real app, use DataLoader)
     inputs = torch.tensor([ [STOI[c] for c in s] for s in df_windows['input'] ]).long().to(device)
     targets = torch.tensor([ STOI[c] for c in df_windows['target'] ]).long().to(device)
     
-    # Shuffle
     perm = torch.randperm(len(inputs))
     inputs, targets = inputs[perm], targets[perm]
     
@@ -246,9 +272,6 @@ def run(
     with typer.progressbar(range(epochs)) as progress:
         for epoch in progress:
             model.train()
-            
-            # Mini-batch (simplified)
-            start_idx = 0
             batch_size = 32
             epoch_loss = 0
             
@@ -265,14 +288,14 @@ def run(
                 
                 epoch_loss += loss.item()
             
-            avg_loss = epoch_loss / (len(inputs)//batch_size)
+            avg_loss = epoch_loss / (len(inputs)//batch_size if (len(inputs)//batch_size) > 0 else 1)
             progress.update(epoch, postfix={f"Loss: {avg_loss:.4f}"})
 
     # 6. SAVE
     typer.secho(f"\n[Phase 5] Saving Vessel", fg=typer.colors.BRIGHT_CYAN)
     torch.save(model.state_dict(), model_out)
-    typer.echo(f" Model saved to: {model_out}")
-    typer.echo(f"\n Process Complete!")
+    typer.echo(f"✅ Model saved to: {model_out}")
+    typer.echo(f"\n🎉 Process Complete!")
 
 if __name__ == "__main__":
     app()
