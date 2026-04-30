@@ -31,6 +31,8 @@ class PoetEncoder:
     def encode_dataframe(self, df):
         # Wrapper to encode whole DF
         tokens = []
+        # Ensure column names are lowercase as expected by the loop below
+        df.columns = [c.lower() for c in df.columns]
         for i in range(len(df)):
             # Assuming df has high/low/open/close
             t = self.encode_candle(

@@ -1,10 +1,9 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
 
 class NanoMold(nn.Module):
-    def __init__(self, vocab_size, d_model=128, n_heads=4, n_layers=4, max_seq_len=64):
+    def __init__(self, vocab_size=7, d_model=128, n_heads=4, n_layers=4, max_seq_len=64):
         super().__init__()
         self.d_model = d_model
         self.tok_emb = nn.Embedding(vocab_size, d_model)
@@ -36,7 +35,8 @@ class NanoMold(nn.Module):
         
         # Causal Mask
         mask = nn.Transformer.generate_square_subsequent_mask(T).to(x.device)
-        x = self.transformer(x, x, mask=mask)
+        # For TransformerDecoder, mask is passed as tgt_mask
+        x = self.transformer(x, x, tgt_mask=mask)
         
         x = self.ln_f(x)
         logits = self.head(x)

@@ -8,6 +8,10 @@ from pathlib import Path
 from datetime import datetime, timedelta
 import time
 
+# Import Core Components
+from nano_market_poets.core.model import NanoMold
+from nano_market_poets.core.encoder import PoetEncoder
+
 # ============================================
 # CONFIGURATION
 # ============================================
@@ -16,8 +20,8 @@ DATA_TRAIN = Path("data/training")
 DATA_MODELS = Path("data/models")
 VIRGIN_PATH = DATA_MODELS / "virgin_mold.pth"
 
-ALPHABET = ['B', 'I', 'U', 'D', 'X', 'W', 'w']
-STOI = {s: i for i, s in enumerate(ALPHABET)}
+ALPHABET = PoetEncoder.ALPHABET
+STOI = PoetEncoder.STOI
 VOCAB_SIZE = len(ALPHABET)
 SEQ_LEN = 64
 
@@ -32,77 +36,84 @@ class DataFetcher:
         self.tf = timeframe
         self.days = days
 
+
     def fetch(self, save_path: Path):
-        typer.echo(f"🔌 Fetching {self.asset} ({self.tf}) for {self.days} days...")
-        typer.echo(f"   [Note: Yahoo limits 1m data to 7 days. Fetching in chunks...]")
+        """Universal Fetcher using Dukascopy"""
+        typer.echo(f"🔌 Fetching {self.asset} ({self.tf}) from Dukascopy...")
 
         try:
-            import yfinance as yf
-            # Map standard TFs to Yahoo TFs
-            tf_map = {'M1': '1m', 'H1': '1h', 'D': '1d', 'M15': '15m'}
-            yf_tf = tf_map.get(self.tf, '1m')
+            # NOTE: You must have installed dukascopy-python
+            # pip install dukascopy-python
+            import dukascopy_python
+            from dukascopy_python import instruments
             
-            ticker = f"{self.asset[:3]}{self.asset[3:]}=X"
+            # --- Mapping Logic (CLI Arg -> Dukascopy Constant) ---
+            asset_map = {
+                'EURUSD': instruments.FX_MAJORS_EUR_USD,
+                'GBPUSD': instruments.FX_MAJORS_GBP_USD,
+                'USDJPY': instruments.FX_MAJORS_USD_JPY,
+                # Add others here...
+            }
             
-            # CALCULATE DATES
-            end_date = datetime.now()
-            start_date = end_date - timedelta(days=self.days)
-            
-            # CHUNKED DOWNLOAD (To bypass 7-day limit)
-            all_dfs = []
-            current_chunk_end = end_date
-            
-            while current_chunk_end > start_date:
-                current_chunk_start = current_chunk_end - timedelta(days=7)
-                
-                # Format dates for yfinance
-                start_str = current_chunk_start.strftime('%Y-%m-%d')
-                end_str = current_chunk_end.strftime('%Y-%m-%d')
-                
-                typer.echo(f"   📥 Fetching {start_str} to {end_str}...", nl=False)
-                
-                try:
-                    temp_df = yf.download(ticker, start=start_str, end=end_str, interval=yf_tf, progress=False)
-                    all_dfs.append(temp_df)
-                    typer.echo(" ✅", fg=typer.colors.GREEN)
-                except Exception as e:
-                    typer.echo(f" ⚠️  Error in chunk: {e}")
-                
-                # Move back 7 days
-                current_chunk_end = current_chunk_start
-                # Small delay to be polite to API
-                time.sleep(0.5)
+            tf_map = {
+                'M1': dukascopy_python.INTERVAL_MINUTE_1,
+                'M5': dukascopy_python.INTERVAL_MINUTE_5,
+                'M15': dukascopy_python.INTERVAL_MINUTE_15,
+                'H1': dukascopy_python.INTERVAL_HOUR_1,
+                'H4': dukascopy_python.INTERVAL_HOUR_4,
+                'D': dukascopy_python.INTERVAL_DAY_1,
+            }
 
-            # MERGE ALL CHUNKS
-            if not all_dfs:
-                typer.secho(f"❌ No data retrieved.", fg=typer.colors.RED)
-                raise Exception("Download failed")
-                
-            df = pd.concat(all_dfs)
+            instrument_class = asset_map.get(self.asset.upper())
+            if not instrument_class:
+                typer.secho(f"❌ Asset {self.asset} not configured in patch.", fg=typer.colors.RED)
+                typer.secho(f"   Add it to asset_map in patch.py", fg=typer.colors.RED)
+                return
+
+            interval_class = tf_map.get(self.tf.upper())
+            if not interval_class:
+                typer.secho(f"❌ Timeframe {self.tf} not configured in patch.", fg=typer.colors.RED)
+                return
+
+            # --- Date Logic ---
+            end = datetime.now()
+            start = end - timedelta(days=self.days)
             
-            # CLEAN UP & SORT
+            # Fix system time issue (if clock is set to future)
+            if end > datetime.utcnow() + timedelta(days=1):
+                end = datetime.utcnow()
+                start = end - timedelta(days=self.days)
+
+            # --- Fetch ---
+            typer.echo(f"   Range: {start.date()} to {end.date()}")
+            
+            df = dukascopy_python.fetch(
+                instrument=instrument_class,
+                interval=interval_class,
+                offer_side=dukascopy_python.OFFER_SIDE_BID,
+                start=start,
+                end=end,
+            )
+            
+            # --- Formatting for Poet Parser ---
             df.reset_index(inplace=True)
-            df.rename(columns={'Date': 'UTC', 'Datetime': 'UTC'}, inplace=True)
-            df = df.sort_values('UTC').drop_duplicates(subset=['UTC']).reset_index(drop=True)
-            
-            # SELECT ONLY OHLCV
+            # Standardize columns to match parser expectation
+            df.rename(columns={'Date': 'UTC', 'Datetime': 'UTC', 'timestamp': 'UTC'}, inplace=True)
             df = df[['UTC', 'Open', 'High', 'Low', 'Close', 'Volume']]
             
+            # --- Save ---
+            save_path.parent.mkdir(parents=True, exist_ok=True)
+            df.to_csv(save_path, index=False)
+            typer.secho(f"✅ Saved {len(df)} bars to {save_path}", fg=typer.colors.GREEN)
+
+        except ImportError:
+            typer.secho(f"❌ 'dukascopy-python' library not found.", fg=typer.colors.RED)
+            typer.secho(f"   Run: pip install dukascopy-python", fg=typer.colors.YELLOW)
         except Exception as e:
-            typer.echo(f"❌ Fetch failed: {e}")
+            typer.secho(f"❌ Dukascopy fetch failed: {e}", fg=typer.colors.RED)
             raise e
-
-        # SAVE
-        save_path.parent.mkdir(parents=True, exist_ok=True)
-        df.to_csv(save_path, index=False)
-        typer.echo(f"✅ Saved {len(df)} bars to {save_path}")
-
-# ============================================
-# 2. FIXED ENCODER (Handles String/Float Conversion)
-# ============================================
-class SmartPoetEncoder:
     def __init__(self):
-        pass
+        self.core_encoder = PoetEncoder()
         
     def encode_df(self, df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()
@@ -110,53 +121,23 @@ class SmartPoetEncoder:
         # 1. Normalize Headers
         df.columns = df.columns.str.strip().str.replace('\ufeff', '').str.title()
         
-        # 2. FIX THE CRASH: Force Numeric Conversion
-        # This fixes "operation 'sub' not supported for dtype 'str'"
+        # 2. Force Numeric Conversion
         numeric_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
         for col in numeric_cols:
             if col in df.columns:
-                # Convert to numeric, coerce errors to NaN (safe fallback)
                 df[col] = pd.to_numeric(df[col], errors='coerce')
         
-        # Drop rows with NaNs in price data (bad parsing)
+        # Drop rows with NaNs in price data
         df.dropna(subset=['Open', 'High', 'Low', 'Close'], inplace=True)
         
-        # 3. ATR
-        high, low, close = df['High'], df['Low'], df['Close']
-        tr1 = high - low
-        tr2 = (high - close.shift()).abs()
-        tr3 = (low - close.shift()).abs()
-        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-        atr = tr.rolling(window=14).mean()
-        df['ATR'] = atr
-        
-        # 4. Logic
+        # 3. Use core encoder for tokenization
         tokens = []
         for i in range(len(df)):
             row = df.iloc[i]
-            curr_atr = row['ATR']
-            
-            if pd.isna(curr_atr) or curr_atr <= 0:
-                tokens.append(STOI['X'])
-                continue
-            
-            o, h, l, c = row['Open'], row['High'], row['Low'], row['Close']
-            body = abs(c - o)
-            rng = h - l
-            
-            u_wick = h - max(o, c)
-            l_wick = min(o, c) - l
-            
-            # Decision Logic
-            if (u_wick / rng > 0.5 and u_wick > body*1.5): tok = 'W'
-            elif (l_wick / rng > 0.5 and l_wick > body*1.5): tok = 'w'
-            elif (body/rng < 0.1 and body/curr_atr < 0.3): tok = 'X'
-            elif c > o:
-                tok = 'B' if (body/curr_atr > 0.8) else 'U'
-            else:
-                tok = 'I' if (body/curr_atr > 0.8) else 'D'
-                
-            tokens.append(STOI[tok])
+            tok_id = self.core_encoder.encode_candle(
+                row['Open'], row['High'], row['Low'], row['Close']
+            )
+            tokens.append(tok_id)
             
         df['TokenID'] = tokens
         df['Letter'] = [ALPHABET[t] for t in tokens]
@@ -175,32 +156,7 @@ class SmartPoetEncoder:
         return pd.DataFrame(windows)
 
 # ============================================
-# 3. THE MODEL (Nano Mold)
-# ============================================
-class NanoMold(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.tok_emb = nn.Embedding(VOCAB_SIZE, 64)
-        self.pos_emb = nn.Parameter(torch.zeros(1, SEQ_LEN, 64))
-        
-        layer = nn.TransformerDecoderLayer(
-            d_model=64, nhead=4, dim_feedforward=64*2, 
-            dropout=0.1, batch_first=True
-        )
-        self.transformer = nn.TransformerDecoder(layer, num_layers=4)
-        self.ln_f = nn.LayerNorm(64)
-        self.head = nn.Linear(64, VOCAB_SIZE, bias=False)
-
-    def forward(self, x):
-        B, T = x.size()
-        x = self.tok_emb(x) + self.pos_emb[:, :T, :]
-        mask = nn.Transformer.generate_square_subsequent_mask(T).to(x.device)
-        x = self.transformer(x, x, mask=mask)
-        x = self.ln_f(x)
-        return self.head(x)[:, -1, :]
-
-# ============================================
-# 4. MAIN CLI
+# 3. MAIN CLI
 # ============================================
 
 @app.command()
@@ -231,7 +187,7 @@ def run(
         typer.echo("❌ Raw file not found!")
         raise typer.Exit()
         
-    encoder = SmartPoetEncoder()
+    encoder = PoetCLIEncoder()
     df_encoded = encoder.encode_df(df_raw)
     df_windows = encoder.to_windows(df_encoded)
     df_windows.to_csv(train_file, index=False)
@@ -243,7 +199,8 @@ def run(
     device = "cuda" if torch.cuda.is_available() else "cpu"
     typer.echo(f"   Device: {device}")
     
-    model = NanoMold().to(device)
+    # Use standardized d_model=128 from Core
+    model = NanoMold(vocab_size=VOCAB_SIZE, d_model=128).to(device)
     
     if mode == "train":
         if not VIRGIN_PATH.exists():
@@ -262,6 +219,10 @@ def run(
     typer.secho(f"\n[Phase 4] Training Vessel", fg=typer.colors.BRIGHT_CYAN)
     
     epochs = 10
+    if len(df_windows) == 0:
+        typer.secho("❌ No training samples generated!", fg=typer.colors.RED)
+        raise typer.Exit()
+
     inputs = torch.tensor([ [STOI[c] for c in s] for s in df_windows['input'] ]).long().to(device)
     targets = torch.tensor([ STOI[c] for c in df_windows['target'] ]).long().to(device)
     
