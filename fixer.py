@@ -12,47 +12,42 @@ NEW_DATAFETCHER_CODE = """
         try:
             # NOTE: You must have installed dukascopy-python
             # pip install dukascopy-python
+            import dukascopy_python
+            from dukascopy_python import instruments
             
             # --- Mapping Logic (CLI Arg -> Dukascopy Constant) ---
-            # You may need to expand this dictionary for more assets/TFs
             asset_map = {
-                'EURUSD': 'INSTRUMENT_FX_MAJORS_EUR_USD',
-                'GBPUSD': 'INSTRUMENT_FX_MAJORS_GBP_USD',
-                'USDJPY': 'INSTRUMENT_FX_MAJORS_USD_JPY',
+                'EURUSD': instruments.FX_MAJORS_EUR_USD,
+                'GBPUSD': instruments.FX_MAJORS_GBP_USD,
+                'USDJPY': instruments.FX_MAJORS_USD_JPY,
                 # Add others here...
             }
             
             tf_map = {
-                'M1': 'INTERVAL_MINUTE_1',
-                'M5': 'INTERVAL_MINUTE_5',
-                'M15': 'INTERVAL_MINUTE_15',
-                'H1': 'INTERVAL_HOUR_1',
-                'H4': 'INTERVAL_HOUR_4',
-                'D': 'INTERVAL_DAY_1',
+                'M1': dukascopy_python.INTERVAL_MINUTE_1,
+                'M5': dukascopy_python.INTERVAL_MINUTE_5,
+                'M15': dukascopy_python.INTERVAL_MINUTE_15,
+                'H1': dukascopy_python.INTERVAL_HOUR_1,
+                'H4': dukascopy_python.INTERVAL_HOUR_4,
+                'D': dukascopy_python.INTERVAL_DAY_1,
             }
 
-            instrument_str = asset_map.get(self.asset.upper())
-            if not instrument_str:
+            instrument_class = asset_map.get(self.asset.upper())
+            if not instrument_class:
                 typer.secho(f\"❌ Asset {self.asset} not configured in patch.\", fg=typer.colors.RED)
                 typer.secho(f\"   Add it to asset_map in patch.py\", fg=typer.colors.RED)
                 return
 
-            # Dynamic Import (To handle the string mapping)
-            from dukascopy_python.instruments import INSTRUMENT_FX_MAJORS_EUR_USD
-            from dukascopy_python.instruments import INSTRUMENT_FX_MAJORS_GBP_USD
-            # Import others as needed...
-            import dukascopy_python
-            
-            # Get the actual class object from string
-            instrument_class = eval(instrument_str)
-            interval_class = eval(dukapyscope.python.name + '.' + tf_map.get(self.tf.upper()))
+            interval_class = tf_map.get(self.tf.upper())
+            if not interval_class:
+                typer.secho(f\"❌ Timeframe {self.tf} not configured in patch.\", fg=typer.colors.RED)
+                return
 
             # --- Date Logic ---
             end = datetime.now()
             start = end - timedelta(days=self.days)
             
             # Fix system time issue (if clock is set to future)
-            # If end > today by more than 1 day, clamp it
             if end > datetime.utcnow() + timedelta(days=1):
                 end = datetime.utcnow()
                 start = end - timedelta(days=self.days)
@@ -69,10 +64,6 @@ NEW_DATAFETCHER_CODE = """
             )
             
             # --- Formatting for Poet Parser ---
-            # Remove timezone offset if needed (you mentioned subtracting 3 hours)
-            # df.index = df.index - timedelta(hours=3) 
-            # (Optional: Uncomment line above if your server time differs)
-            
             df.reset_index(inplace=True)
             # Standardize columns to match parser expectation
             df.rename(columns={'Date': 'UTC', 'Datetime': 'UTC', 'timestamp': 'UTC'}, inplace=True)
@@ -115,19 +106,6 @@ def apply_patch():
     print("🔧 Fixed typer.echo color formatting errors.")
 
     # --- PATCH 2: Replace DataFetcher.fetch method ---
-    # We look for the existing method definition and replace everything until the next class method or end of class
-    # Simple approach: Find "def fetch(self" and replace until the next method def or class def
-    
-    # Regex to find the specific fetch method in DataFetcher class
-    fetch_method_regex = r'(class DataFetcher:.*?)(    def fetch\(self.*?)(?=    def |\nclass |\nclass |\Z)'
-    
-    # We want to keep the class def, replace the method def
-    # However, a simpler way is just replacing the whole fetch method block if we identify it uniquely.
-    # Let's try a cleaner approach: Just look for "def fetch" inside "DataFetcher"
-    
-    # This regex is a bit complex, let's do a simpler "Replace this block" approach.
-    # We will search for the specific fetch definition line.
-    
     # Finding the start of the fetch method
     start_marker = "    def fetch(self, save_path: Path):"
     if start_marker in content:

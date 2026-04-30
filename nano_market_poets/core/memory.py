@@ -1,6 +1,8 @@
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 import torch
+import torch.nn as nn
+from .encoder import PoetEncoder
 
 class PoetryAnthology:
     """
@@ -19,7 +21,10 @@ class PoetryAnthology:
             # Simplified embedding extraction
             x = self.model.tok_emb(t_stanza) + self.model.pos_emb[:, :len(stanza), :]
             mask = nn.Transformer.generate_square_subsequent_mask(len(stanza)).to(x.device)
-            x = self.model.transformer(x, x, mask=mask)
+
+            # Note: In our NanoMold, we pass x as both target and memory
+            # For TransformerDecoder, mask is passed as tgt_mask
+            x = self.model.transformer(x, x, tgt_mask=mask)
             x = self.model.ln_f(x)
             
             return x[0, -1, :].cpu().numpy()
